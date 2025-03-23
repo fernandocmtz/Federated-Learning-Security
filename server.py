@@ -3,19 +3,45 @@ import numpy as np
 import torch
 from model import CNN
 
-# Define median aggregation function
-def median_aggregation(weights_list):
-    return np.median(np.array(weights_list), axis=0)
+# -------------------------
+# Median Aggregation Utils
+# -------------------------
 
-# Define a custom strategy for federated learning
-class RobustFedServer(fl.server.strategy.FedAvg):
+def median_aggregate(results):
+    """Aggregate model weights by computing the median for each layer across clients."""
+    weights = [
+        fl.common.parameters_to_ndarrays(fit_res.parameters)
+        for _, fit_res in results
+    ]
+
+    layer_medians = []
+    for layer_weights in zip(*weights):
+        stacked = np.stack(layer_weights, axis=0)
+        median_layer = np.median(stacked, axis=0)
+        layer_medians.append(median_layer)
+
+    return fl.common.ndarrays_to_parameters(layer_medians)
+
+
+# -------------------------
+# Custom Strategy
+# -------------------------
+
+class MedianAggregationStrategy(fl.server.strategy.FedAvg):
     def aggregate_fit(self, rnd, results, failures):
-        aggregated_parameters = median_aggregation([parameters for parameters, _ in results])
+        if not results:
+            return None, {}
+        aggregated_parameters = median_aggregate(results)
         return aggregated_parameters, {}
 
+# -------------------------
+# Server Start
+# -------------------------
+
 if __name__ == "__main__":
-    # Use the correct start_server function
-    fl.server.start_server(
-        config=fl.server.ServerConfig(num_rounds=5),
-        strategy=RobustFedServer(),
-    )
+   fl.server.start_server(
+    server_address="127.0.0.1:8080",
+    strategy=MedianAggregationStrategy(),
+    config=fl.server.ServerConfig(num_rounds=10)
+
+)
