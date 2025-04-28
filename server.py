@@ -1,123 +1,169 @@
 import flwr as fl
 import numpy as np
-import torch
-from model import CNN
 import argparse
-
-USE_MEDIAN_DEFENSE = False  # Set to True to enable median aggregation defense
-
+import csv
+from model import CNN
 
 # -------------------------
-# Median Aggregation Utils
+# Global tracking
+# -------------------------
+ignored_client_log = []  # stores ignored client IDs per round (for median aggregation)
+
+# Load attacker IDs from file
+try:
+    with open("attacker_ids.txt", "r") as f:
+        attacker_ids = set(f.read().strip().split(","))
+except FileNotFoundError:
+    attacker_ids = set()
+
+# -------------------------
+# Median Aggregation
 # -------------------------
 
 def median_aggregate(results):
-    """Aggregate weights using median."""
-    
-    import numpy as np
-
-    # Extract parameter lists from all clients
+    """Aggregate weights using median and track ignored clients."""
     weights = [fl.common.parameters_to_ndarrays(res.parameters) for _, res in results]
-    num_clients = len(weights)
-
-    # Stack weights layer-by-layer to compute medians
+    client_ids = [client.cid for client, _ in results]
     layer_medians = []
-    ignored_counts = []
+    ignored_indices = set()
 
     for i, layer_weights in enumerate(zip(*weights)):
-        stacked = np.stack(layer_weights, axis=0)  # Shape: (num_clients, ...)
+        stacked = np.stack(layer_weights, axis=0)
         median = np.median(stacked, axis=0)
 
-        # Calculate L2 distance from each client's update to the median
         dists = np.linalg.norm((stacked - median).reshape(stacked.shape[0], -1), axis=1)
-        # Calculate the threshold for outlier detection (e.g., median distance)
-        # Here we use the median distance as a cutoff for outliers
-        threshold = np.percentile(dists, 70)  # Median distance as cutoff
+        threshold = np.percentile(dists, 70)
 
-        # Count how many clients are farther than the threshold
-        ignored = np.sum(dists > threshold)
-        ignored_counts.append(ignored)
+        for idx, dist in enumerate(dists):
+            if dist > threshold:
+                ignored_indices.add(idx)
 
         layer_medians.append(median)
 
-    total_ignored = max(ignored_counts)  # Approximate: max clients ignored across layers
-    print(f"[Median Aggregation] Ignored approx {total_ignored} outlier client(s) this round.")
+    ignored_clients = [client_ids[i] for i in ignored_indices]
+    ignored_client_log.append(ignored_clients)
+
+    attacker_ignored = [cid for cid in ignored_clients if cid in attacker_ids]
+    benign_ignored = [cid for cid in ignored_clients if cid not in attacker_ids]
+
+    print(f"[Median Aggregation] Ignored clients this round: {ignored_clients}")
+    print(f"[Tracking] Ignored attackers this round: {attacker_ignored}")
+    print(f"[Tracking] Ignored benign clients this round: {benign_ignored}")
 
     return fl.common.ndarrays_to_parameters(layer_medians)
 
+# -------------------------
+# Weighted Median Aggregation
+# -------------------------
+
+def weighted_median_aggregate(results):
+    weights = [fl.common.parameters_to_ndarrays(res.parameters) for _, res in results]
+    layer_weighted_avg = []
+
+    for layer_weights in zip(*weights):
+        stacked = np.stack(layer_weights, axis=0)
+        median = np.median(stacked, axis=0)
+
+        dists = np.linalg.norm((stacked - median).reshape(stacked.shape[0], -1), axis=1)
+        dists += 1e-10
+
+        inv_weights = 1.0 / dists
+        normalized_weights = inv_weights / np.sum(inv_weights)
+
+        weighted_avg = np.tensordot(normalized_weights, stacked, axes=1)
+        layer_weighted_avg.append(weighted_avg)
+
+    print("[Weighted Median Aggregation] applied weighted average based on inverse distances.")
+    return fl.common.ndarrays_to_parameters(layer_weighted_avg)
 
 # -------------------------
-# Custom Strategy
+# Strategy Classes
 # -------------------------
 
 class MedianAggregationStrategy(fl.server.strategy.FedAvg):
-    """Custom strategy that uses median aggregation."""
-     
-    #def __init__(self): Set for 10 clients 
     def __init__(self):
-        super().__init__(
-            fraction_fit=1.0,             # Use all available clients
-            min_fit_clients=10,           # Require 10 clients to run each round
-            min_available_clients=10      # Must have at least 10 clients connected
-        )
+        super().__init__(fraction_fit=1.0, min_fit_clients=10, min_available_clients=10)
 
     def aggregate_fit(self, rnd, results, failures):
         if not results:
             return None, {}
-        aggregated_parameters = median_aggregate(results)
-        return aggregated_parameters, {}
-    
+        return median_aggregate(results), {}
+
     def aggregate_evaluate(self, rnd, results, failures):
         if not results:
             return None, {}
-
         losses = [res.loss for _, res in results]
         accuracies = [res.metrics["accuracy"] for _, res in results]
+        return float(np.mean(losses)), {"accuracy": float(np.mean(accuracies))}
 
-        avg_loss = float(np.mean(losses))
-        avg_accuracy = float(np.mean(accuracies))
+class WeightedMedianAggregationStrategy(fl.server.strategy.FedAvg):
+    def __init__(self):
+        super().__init__(fraction_fit=1.0, min_fit_clients=10, min_available_clients=10)
 
-        return avg_loss, {"accuracy": avg_accuracy}
+    def aggregate_fit(self, rnd, results, failures):
+        if not results:
+            return None, {}
+        return weighted_median_aggregate(results), {}
+
+    def aggregate_evaluate(self, rnd, results, failures):
+        if not results:
+            return None, {}
+        losses = [res.loss for _, res in results]
+        accuracies = [res.metrics["accuracy"] for _, res in results]
+        return float(np.mean(losses)), {"accuracy": float(np.mean(accuracies))}
+
+class FedAvgWithEval(fl.server.strategy.FedAvg):
+    def aggregate_evaluate(self, rnd, results, failures):
+        if not results:
+            return None, {}
+        losses = [res.loss for _, res in results]
+        accuracies = [res.metrics["accuracy"] for _, res in results]
+        return float(np.mean(losses)), {"accuracy": float(np.mean(accuracies))}
 
 # -------------------------
-# Server Start
+# Entry Point
 # -------------------------
 
 if __name__ == "__main__":
-    
-    if USE_MEDIAN_DEFENSE:
-        print("[Server] Median aggregation defense ENABLED.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--strategy", type=str, choices=["fedavg", "median", "weighted"], required=True)
+    args = parser.parse_args()
+
+    if args.strategy == "median":
+        print("[Server] Using Median Aggregation Strategy")
         strategy = MedianAggregationStrategy()
+    elif args.strategy == "weighted":
+        print("[Server] Using Weighted Median Aggregation Strategy")
+        strategy = WeightedMedianAggregationStrategy()
     else:
-        print("[Server] FedAvg (no defense) ENABLED.")
-        class FedAvgWithEval(fl.server.strategy.FedAvg):
-            def aggregate_evaluate(self, rnd, results, failures):
-                if not results:
-                    return None, {}
-
-                losses = [res.loss for _, res in results]
-                accuracies = [res.metrics["accuracy"] for _, res in results]
-
-                avg_loss = float(np.mean(losses))
-                avg_accuracy = float(np.mean(accuracies))
-
-                return avg_loss, {"accuracy": avg_accuracy}
-
-        strategy = FedAvgWithEval(
-            fraction_fit=1.0,
-            min_fit_clients=10,
-            min_available_clients=10
-        )
-        """strategy = fl.server.strategy.FedAvg(
-            fraction_fit=1.0,
-            min_fit_clients=10,
-            min_available_clients=10
-        )"""
+        print("[Server] Using FedAvg (no defense)")
+        strategy = FedAvgWithEval(fraction_fit=1.0, min_fit_clients=10, min_available_clients=10)
 
     fl.server.start_server(
         server_address="127.0.0.1:8080",
         strategy=strategy,
         config=fl.server.ServerConfig(num_rounds=10)
     )
-    
 
+    # Print round-by-round
+    print("\n=== Ignored clients by round ===")
+    for rnd, ignored in enumerate(ignored_client_log, 1):
+        print(f"Round {rnd}: {ignored}")
+
+    # Save CSV summary
+    with open("ignored_summary.csv", "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Round", "Ignored_Total", "Ignored_Attackers", "Ignored_Benigns"])
+
+        for rnd, ignored in enumerate(ignored_client_log, 1):
+            ignored_attackers = [cid for cid in ignored if cid in attacker_ids]
+            ignored_benign = [cid for cid in ignored if cid not in attacker_ids]
+
+            writer.writerow([
+                rnd,
+                len(ignored),
+                len(ignored_attackers),
+                len(ignored_benign),
+            ])
+
+    print("✅ CSV report saved as ignored_summary.csv")
