@@ -10,35 +10,32 @@ import argparse
 
 
 BATCH_SIZE = 32
-LABEL_FLIP_PROB = 0.3  # 30% of labels will be flipped (attack)
+
 
 # Disable SSL verification to avoid dataset download errors
 ssl._create_default_https_context = ssl._create_unverified_context  
 
-""" def load_data():
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_data = datasets.MNIST(root="data", train=True, download=True, transform=transform)
 
-    # Introduce label flipping for adversarial clients
-    for i in range(len(train_data.targets)):
-        if np.random.rand() < LABEL_FLIP_PROB:
-            train_data.targets[i] = (train_data.targets[i] + 1) % 10  # Flip labels
-
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
-    return train_loader
-"""
 # CHANGE NEW Load data with optional label flipping for adversarial clients
 def load_data(do_label_flip=False):
     transform = transforms.Compose([transforms.ToTensor()])
     train_data = datasets.MNIST(root="data", train=True, download=True, transform=transform)
 
     if do_label_flip:
+
+        # --- count originals before flipping ---
+        orig_labels = train_data.targets.clone()
+
         print("[INFO] Flipping labels in this client...")
-        # Flip 30% of the labels randomly
         for i in range(len(train_data.targets)):
-            """if np.random.rand() < 0.3: this was 30% of labels will be flipped (attack)
-                train_data.targets[i] = (train_data.targets[i] + 1) % 10"""
+            
             train_data.targets[i] = (train_data.targets[i] + 1) % 10  # Flip labels 100% of labels
+    
+    # --- verify ---
+        flips = (train_data.targets != orig_labels).sum().item()
+        total = len(train_data.targets)
+        pct   = 100 * flips / total
+        print(f"[POISON]   flipped {flips}/{total} labels  ({pct:.1f} %)")
 
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
     return train_loader
@@ -59,11 +56,14 @@ def train(model, train_loader, epochs=1):
             optimizer.step()
     return model.state_dict()
 
+
 class MNISTClient(fl.client.NumPyClient):
-    """Flower client for MNIST dataset."""
-    def __init__(self, is_attacker=False):
+    def __init__(self, cid: int, is_attacker: bool = False):
+        self.cid = cid            # store numeric ID for logging if you like
         self.model = CNN()
         self.train_loader = load_data(do_label_flip=is_attacker)
+
+
 
     def get_parameters(self, config):
         self.model.to("cpu") # Move model to CPU for parameter retrieval New
@@ -76,6 +76,8 @@ class MNISTClient(fl.client.NumPyClient):
         # Set the model parameters
         for param, new_param in zip(self.model.state_dict().values(), parameters):
             param.data = torch.tensor(new_param)
+        #for p, new_p in zip(self.model.state_dict().values(), parameters):
+        #    p.data = torch.tensor(new_p)
 
         # Train the model
         updated_weights = train(self.model, self.train_loader)
@@ -83,7 +85,7 @@ class MNISTClient(fl.client.NumPyClient):
         # Convert to list of NumPy arrays
         weights_numpy = [val.cpu().numpy() for _, val in updated_weights.items()]
 
-        return weights_numpy, len(self.train_loader.dataset), {}
+        return weights_numpy, len(self.train_loader.dataset), {"client_id": self.cid}
     
     
     def evaluate(self, parameters, config):
@@ -142,6 +144,18 @@ if __name__ == "__main__":
     
     fl.client.start_numpy_client(
         server_address="127.0.0.1:8080",
-        client=MNISTClient(is_attacker=args.attack)
+        client=MNISTClient(cid=args.id, is_attacker=args.attack)
+        #client=MNISTClient(is_attacker=args.attack)
     )
+
+class MNISTClient(fl.client.NumPyClient):
+    def __init__(self, cid: int, is_attacker: bool = False):
+    #def __init__(self, cid, is_attacker=False):
+        self.cid  = cid          # save 1-based numeric id
+        ...                     # rest unchanged
+
+    # Flower asks for properties once at startup
+    def get_properties(self, config):
+        return {"client_id": str(self.cid)}
+
 
