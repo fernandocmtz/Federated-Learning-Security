@@ -1,13 +1,50 @@
 import flwr as fl
 import numpy as np
-import argparse
-import csv
+import argparse, csv, datetime
 from model import CNN
+import pandas as pd         
+
+ignored_client_log = []
+round_metrics       = []     # stores (loss, acc, …) per round
+ignored_client_hex_log  = []   # raw hex, for counting attackers
+# -------------------------
+#Number of Rounds
+num_rounds = 7
+
+def median_trim_aggregate(results, trim_frac=0.40): #max 40% of clients ignored
+    """Median aggregation with trimming of the worst clients."""
+    weights = [fl.common.parameters_to_ndarrays(r.parameters) for _, r in results]
+    cids    = [p.cid for p, _ in results]
+    k       = max(1, int(np.ceil(trim_frac * len(weights))))   # ≤ 2 for N=10
+
+    # ---- average distance over layers ----
+    d_tot = np.zeros(len(weights))
+    for layer in zip(*weights):
+        med   = np.median(np.stack(layer, axis=0), axis=0)
+        dists = np.linalg.norm(
+                    (np.stack(layer, axis=0) - med).reshape(len(weights), -1),
+                    axis=1)
+        d_tot += dists
+    d_tot /= len(weights)
+    # ---------------------------------------
+
+    worst_idx   = np.argsort(d_tot)[-k:]
+    ignored_hex = [cids[i] for i in worst_idx]
+
+    # simply return the per-layer median of all clients
+    new_params = fl.common.ndarrays_to_parameters(
+        [np.median(np.stack(layer, axis=0), axis=0) for layer in zip(*weights)]
+    )
+    return new_params, ignored_hex
+
+
+
+
 
 # -------------------------
 # Global tracking
 # -------------------------
-ignored_client_log = []  # stores ignored client IDs per round (for median aggregation)
+
 
 # Load attacker IDs from file
 try:
@@ -48,71 +85,45 @@ def median_aggregate(results):
 # -------------------------
 
 def weighted_median_aggregate(results):
-    weights_nd   = [fl.common.parameters_to_ndarrays(res.parameters) for _, res in results]
-    client_hex   = [proxy.cid for proxy, _ in results]
+    weights_nd  = [fl.common.parameters_to_ndarrays(r.parameters) for _, r in results]
+    client_hex  = [p.cid for p, _ in results]
 
     layer_out   = []
     client_w    = np.zeros(len(client_hex))
 
     for layer_weights in zip(*weights_nd):
-        stacked = np.stack(layer_weights, axis=0)       # shape (N, …)
+        stacked = np.stack(layer_weights, axis=0)
         median  = np.median(stacked, axis=0)
 
-        dists   = np.linalg.norm((stacked - median).reshape(stacked.shape[0], -1), axis=1)
+        dists   = np.linalg.norm((stacked - median).reshape(len(client_hex), -1), axis=1)
 
-        median_d = np.median(dists)
-        scaled   = dists / (median_d + 1e-12)
+        # -------------  TUNE Acordingly  -------------
+        gamma   = 20.0                    # ← steeper drop-off than 5.0
+        raw_w   = np.exp(-gamma * dists)  # weight = e^(−γ·d)
+        raw_w  /= raw_w.sum()
+        # -----------------------------------------------
 
-        gamma  = 35.0                # the larger, the steeper the drop-off
-        raw_w  = np.exp(-gamma * scaled)
-        raw_w /= raw_w.sum()
-        #raw_w   = 1.0 / (1.0 + dists)
-        #raw_w  /= raw_w.sum()                           # normalise
-
-        
-        # ------ use np.average: no manual broadcasting needed ------
-        weighted_avg = np.average(stacked, axis=0, weights=raw_w)
-        # -----------------------------------------------------------
-
-        layer_out.append(weighted_avg)
         client_w += raw_w
-    
-    client_w /= client_w.sum()                # normalise weights
+        weighted_avg = np.average(stacked, axis=0, weights=raw_w)
+        layer_out.append(weighted_avg)
 
+    # normalise over layers
+    client_w /= client_w.sum()
 
-    fair = 1.0 / len(client_hex)
-    ignored_hex = [cid for cid, w in zip(client_hex, client_w) if w < 0.8 * fair]# list clients that got very small overall weight
-
-    
-    #ignored_hex = [cid for cid, w in zip(client_hex, client_w) if w < 0.40]
-
-    aggregated = fl.common.ndarrays_to_parameters(layer_out)
+    # ----- choose a “low weight” cut-off relative to fairness ----------
+    fair        = 1.0 / len(client_hex)      # ideal equal share (=0.10 for N=10)
+    low_frac    = 0.7                        # keep 60% of clients
+    threshold   = low_frac * fair            # → 0.08 for N=10
+    ignored_hex = [cid for cid, w in zip(client_hex, client_w) if w < threshold]
+    # ------------------------------------------------------------------
 
     print("[DEBUG] client weights:", {cid[:6]: f"{w:.3f}" for cid, w in zip(client_hex, client_w)})
 
+    aggregated  = fl.common.ndarrays_to_parameters(layer_out)
     return aggregated, ignored_hex
 
-"""
-def weighted_median_aggregate(results):
-    weights = [fl.common.parameters_to_ndarrays(res.parameters) for _, res in results]
-    layer_weighted_avg = []
 
-    for layer_weights in zip(*weights):
-        stacked = np.stack(layer_weights, axis=0)
-        median = np.median(stacked, axis=0)
 
-        dists = np.linalg.norm((stacked - median).reshape(stacked.shape[0], -1), axis=1)
-        dists += 1e-10
-
-        inv_weights = 1.0 / dists
-        normalized_weights = inv_weights / np.sum(inv_weights)
-
-        weighted_avg = np.tensordot(normalized_weights, stacked, axes=1)
-        layer_weighted_avg.append(weighted_avg)
-
-    print("[Weighted Median Aggregation] applied weighted average based on inverse distances.")
-    return fl.common.ndarrays_to_parameters(layer_weighted_avg)
-"""
 # -------------------------
 # Strategy Classes
 # -------------------------
@@ -135,21 +146,33 @@ class MedianAggregationStrategy(fl.server.strategy.FedAvg):
                 self.cid_map[hex_cid] = f"Client {client_id}"
 
         # median_aggregate returns (params, ignored_hex_list)
-        aggregated_params, ignored_hex = median_aggregate(results)
+        #aggregated_params, ignored_hex = median_aggregate(results)
+        aggregated_params, ignored_hex = median_trim_aggregate(results) 
 
         ignored_readable = [self.cid_map.get(x, x[:6]) for x in ignored_hex]
         print(f"[Median] Ignored this round: {ignored_readable}")
         
         ignored_client_log.append(ignored_readable)
+        ignored_client_hex_log.append(ignored_hex) 
 
         return aggregated_params, {}
-    
+    """
     def aggregate_evaluate(self, rnd, results, failures):
         if not results:
             return None, {}
         loss       = np.mean([res.loss for _, res in results])
         accuracy   = np.mean([res.metrics["accuracy"] for _, res in results])
         return float(loss), {"accuracy": float(accuracy)}
+    """
+    
+    def aggregate_evaluate(self, rnd, results, failures):
+        if not results:
+            return None, {}
+        loss = np.mean([res.loss for _, res in results])
+        acc  = np.mean([res.metrics["accuracy"] for _, res in results])
+        round_metrics.append((rnd, loss, acc))          # <- NEW
+        return float(loss), {"accuracy": float(acc)}
+
     
 
 
@@ -171,20 +194,38 @@ class WeightedMedianStrategy(fl.server.strategy.FedAvg):
                 self.cid_map[cid_hex] = f"Client {num_id}"
 
         aggregated, ignored_hex = weighted_median_aggregate(results)
+
+        
         ignored_readable = [self.cid_map.get(x, x[:6]) for x in ignored_hex]
 
         print(f"[WeightedMedian] very-low-weight clients this round: {ignored_readable}")
+        #ignored_client_log.append(ignored_readable)
         ignored_client_log.append(ignored_readable)
+        ignored_client_hex_log.append(ignored_hex)
 
         return aggregated, {}
-
-
-class FedAvgWithEval(fl.server.strategy.FedAvg):
+    
     def aggregate_evaluate(self, rnd, results, failures):
         if not results:
             return None, {}
-        losses = [res.loss for _, res in results]
-        accuracies = [res.metrics["accuracy"] for _, res in results]
+        loss = np.mean([res.loss for _, res in results])
+        acc  = np.mean([res.metrics["accuracy"] for _, res in results])
+        round_metrics.append((rnd, loss, acc))          
+
+        return float(loss), {"accuracy": float(acc)}
+
+
+
+class FedAvgWithEval(fl.server.strategy.FedAvg):
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.cid_map = {}                 
+
+    def aggregate_evaluate(self, rnd, results, failures):
+        if not results:
+            return None, {}
+        losses      = [res.loss for _, res in results]
+        accuracies  = [res.metrics["accuracy"] for _, res in results]
         return float(np.mean(losses)), {"accuracy": float(np.mean(accuracies))}
 
 # -------------------------
@@ -209,28 +250,66 @@ if __name__ == "__main__":
     fl.server.start_server(
         server_address="127.0.0.1:8080",
         strategy=strategy,
-        config=fl.server.ServerConfig(num_rounds=10)
+        config=fl.server.ServerConfig(num_rounds) #number of rounds
     )
+# choose a file name by strategy
 
-    # Print round-by-round
-    print("\n=== Ignored clients by round ===")
-    for rnd, ignored in enumerate(ignored_client_log, 1):
-        print(f"Round {rnd}: {ignored}")
+# build a fallback mapping from the hex in attacker_ids.txt
+if not strategy.cid_map:
+    strategy.cid_map = {h: f"Client {i+1}"           # 1 … N
+                        for i, h in enumerate(set().union(*ignored_client_hex_log))}
 
-    # Save CSV summary
-    with open("ignored_summary.csv", "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["Round", "Ignored_Total", "Ignored_Attackers", "Ignored_Benigns"])
+tag = {
+    "median":   "Median_flipping",
+    "weighted": "Weighted_flipping",
+    "fedavg":   "FedAvg_flipping",
+}[args.strategy]
 
-        for rnd, ignored in enumerate(ignored_client_log, 1):
-            ignored_attackers = [cid for cid in ignored if cid in attacker_ids]
-            ignored_benign = [cid for cid in ignored if cid not in attacker_ids]
+ts   = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+path = f"{tag}_{ts}.csv"
 
-            writer.writerow([
-                rnd,
-                len(ignored),
-                len(ignored_attackers),
-                len(ignored_benign),
-            ])
 
-    print("✅ CSV report saved as ignored_summary.csv")
+hex_to_num = {}
+if hasattr(strategy, "cid_map"):
+    hex_to_num = {h: int(lbl.split()[-1]) for h, lbl in strategy.cid_map.items()}
+else:
+    # fallback: generate mapping for FedAvg (no defense)
+    all_hex = set().union(*ignored_client_hex_log) if ignored_client_hex_log else set()
+    hex_to_num = {h: i+1 for i, h in enumerate(all_hex)}
+
+rows = []
+
+
+for i, (rnd, loss, acc) in enumerate(round_metrics):
+    if args.strategy == "fedavg":
+        # No clients ignored in FedAvg
+        rows.append([rnd, loss, acc, 0, 0, 0])
+    else:
+        ignored_readable = ignored_client_log[i]
+        ignored_hex      = ignored_client_hex_log[i]
+
+        att = [
+            h for h in ignored_hex
+            if hex_to_num.get(h) is not None and str(hex_to_num[h]) in attacker_ids
+        ]
+        ben = [
+            h for h in ignored_hex
+            if hex_to_num.get(h) is not None and str(hex_to_num[h]) not in attacker_ids
+        ]
+
+        print("[DEBUG] attacker_ids loaded:", attacker_ids)
+        print("[DEBUG] hex_to_num map:", hex_to_num)
+        print("[DEBUG] ignored_hex:", ignored_hex)
+
+        rows.append([rnd, loss, acc, len(ignored_readable), len(att), len(ben)])
+
+
+df = pd.DataFrame(rows, columns=[
+        "round", "loss", "accuracy",
+        "ignored_total", "ignored_attackers", "ignored_benign"
+     ])
+df.to_csv(path, index=False)
+print(f"✅ CSV report saved as {path}")
+
+
+
