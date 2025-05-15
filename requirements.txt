@@ -53,3 +53,6 @@ typer==0.12.5
 typing_extensions==4.12.2
 tzdata==2025.1
 urllib3==2.3.0
+flwr==1.8.0
+torch torchvision torchaudio   
+numpy pandas matplotlib

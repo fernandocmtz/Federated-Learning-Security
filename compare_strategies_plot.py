@@ -15,7 +15,7 @@ def plot_column(column_name, title, ylabel, output_file):
             df = pd.read_csv(filename)
             plt.plot(df["Round"], df[column_name], marker="o", label=name)
         except FileNotFoundError:
-            print(f"⚠️  File not found: {filename}")
+            print(f" File not found: {filename}")
     plt.title(title)
     plt.xlabel("Round")
     plt.ylabel(ylabel)
@@ -28,7 +28,7 @@ def plot_column(column_name, title, ylabel, output_file):
 # Plot Attackers Ignored
 plot_column(
     column_name="Ignored_Attackers",
-    title="Attackers Ignored per Round – Strategy Comparison",
+    title="Attackers Ignored per Round - Strategy Comparison",
     ylabel="Attackers Ignored",
     output_file="plot_ignored_attackers.png"
 )
@@ -36,7 +36,7 @@ plot_column(
 # Plot Benigns Ignored
 plot_column(
     column_name="Ignored_Benigns",
-    title="Benign Clients Ignored per Round – Strategy Comparison",
+    title="Benign Clients Ignored per Round - Strategy Comparison",
     ylabel="Benign Clients Ignored",
     output_file="plot_ignored_benigns.png"
 )
@@ -44,7 +44,7 @@ plot_column(
 # Plot Total Ignored
 plot_column(
     column_name="Ignored_Total",
-    title="Total Clients Ignored per Round – Strategy Comparison",
+    title="Total Clients Ignored per Round - Strategy Comparison",
     ylabel="Total Clients Ignored",
     output_file="plot_ignored_total.png"
 )

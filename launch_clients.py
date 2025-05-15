@@ -4,7 +4,7 @@ import platform
 
 # Configuration
 num_clients = 10
-num_attackers = 3
+num_attackers = 2
 
 # Detect OS
 current_os = platform.system().lower()
@@ -28,7 +28,7 @@ for client_id in range(1, num_clients + 1):
     attack_flag = "--attack" if client_id in attacker_ids else ""
     command     = f"python client.py --id {client_id} {attack_flag}"
 
-    # --- spawn the process in a platform-friendly way ---
+    # --- spawn the process in Windows ---
     if is_windows:
         # Opens a new Command Prompt window
         subprocess.Popen(f'start "" cmd /k {command}', shell=True)

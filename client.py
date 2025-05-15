@@ -59,14 +59,14 @@ def train(model, train_loader, epochs=1):
 
 class MNISTClient(fl.client.NumPyClient):
     def __init__(self, cid: int, is_attacker: bool = False):
-        self.cid = cid            # store numeric ID for logging if you like
+        self.cid = cid            
         self.model = CNN()
         self.train_loader = load_data(do_label_flip=is_attacker)
 
 
 
     def get_parameters(self, config):
-        self.model.to("cpu") # Move model to CPU for parameter retrieval New
+        self.model.to("cpu") # Move model to CPU for parameter retrieval
         # Convert model parameters to NumPy arrays
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
@@ -152,7 +152,7 @@ class MNISTClient(fl.client.NumPyClient):
     def __init__(self, cid: int, is_attacker: bool = False):
     #def __init__(self, cid, is_attacker=False):
         self.cid  = cid          # save 1-based numeric id
-        ...                     # rest unchanged
+        ...                     
 
     # Flower asks for properties once at startup
     def get_properties(self, config):
