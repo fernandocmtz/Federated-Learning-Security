@@ -4,7 +4,11 @@ import platform
 
 # Configuration
 num_clients = 10
+<<<<<<< HEAD
 num_attackers = 4
+=======
+num_attackers = 3 
+>>>>>>> 58f8ba226ea6fedf9a8d59f0315a7c70a9b00e2f
 
 # Detect OS
 current_os = platform.system().lower()
